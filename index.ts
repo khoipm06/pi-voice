@@ -1,4 +1,18 @@
-import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  CustomEditor,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type KeybindingsManager,
+  type Theme,
+} from "@earendil-works/pi-coding-agent";
+import {
+  matchesKey,
+  truncateToWidth,
+  visibleWidth,
+  type EditorComponent,
+  type EditorTheme,
+  type TUI,
+} from "@earendil-works/pi-tui";
 import { spawn, type ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -23,6 +37,9 @@ interface AntigravityBridge {
   csrfToken: string;
   pid: number;
 }
+
+type VoiceMode = "idle" | "recording" | "finalizing" | "cancelled";
+type VoiceEngine = "bridge" | "cloud";
 
 function logVoice(message: string): void {
   try {
@@ -225,6 +242,26 @@ function pcmToWav(pcmBuffer: Buffer, sampleRate = 16000): Buffer {
   return wav;
 }
 
+function computeRms(buffer: Buffer): number {
+  if (buffer.length < 2) return 0;
+  let sumSq = 0;
+  const numSamples = Math.floor(buffer.length / 2);
+  for (let i = 0; i < buffer.length; i += 2) {
+    const s = buffer.readInt16LE(i);
+    sumSq += s * s;
+  }
+  return Math.sqrt(sumSq / (numSamples || 1));
+}
+
+function getVuWave(rms: number): string {
+  if (rms < 40) return "····";
+  if (rms < 200) return " ▂  ";
+  if (rms < 600) return " ▂▃ ";
+  if (rms < 1500) return " ▂▃▄";
+  if (rms < 3000) return "▂▃▅▆";
+  return "▃▅▆█";
+}
+
 async function transcribeFastDraft(
   wavBuffer: Buffer,
   apiKey: string,
@@ -354,16 +391,275 @@ async function transcribeFinalReconciliation(
   return candidateText.replace(/^["'`]+|["'`]+$/g, "").trim();
 }
 
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+interface VoiceEditorOptions {
+  ctx: ExtensionContext;
+  getMode(): VoiceMode;
+  getEngine(): VoiceEngine;
+  getDurationSec(): string;
+  getLiveDraft(): string;
+  getRms(): number;
+  getTick(): number;
+  onSend(ctx: ExtensionContext): void;
+  onToggle(ctx: ExtensionContext): void;
+  onCancel(ctx: ExtensionContext): void;
+}
+
+function formatTopBorderLine(
+  width: number,
+  leftLabel: string,
+  rightLabel: string,
+  borderFn: (s: string) => string
+): string {
+  if (width <= 0) return "";
+  const leftW = visibleWidth(leftLabel);
+  const rightW = visibleWidth(rightLabel);
+
+  if (leftW + rightW + 2 >= width) {
+    const avail = Math.max(0, width - leftW - 2);
+    const right = truncateToWidth(rightLabel, avail, "");
+    const gap = Math.max(0, width - leftW - visibleWidth(right) - 2);
+    return borderFn("─") + leftLabel + borderFn("─".repeat(gap)) + right + borderFn("─");
+  }
+
+  const gap = Math.max(0, width - leftW - rightW - 2);
+  return borderFn("─") + leftLabel + borderFn("─".repeat(gap)) + rightLabel + borderFn("─");
+}
+
+class VoiceEditorWrapper implements EditorComponent {
+  onSubmit?: (text: string) => void;
+  onChange?: (text: string) => void;
+  borderColor?: (str: string) => string;
+
+  constructor(
+    private readonly base: EditorComponent,
+    private readonly options: VoiceEditorOptions,
+    private readonly defaultBorderColor: (str: string) => string
+  ) {}
+
+  private get baseRecord(): Record<string, unknown> {
+    return this.base as unknown as Record<string, unknown>;
+  }
+
+  get actionHandlers(): Map<string, () => void> | undefined {
+    return this.baseRecord.actionHandlers as Map<string, () => void> | undefined;
+  }
+
+  get onCtrlD(): (() => void) | undefined {
+    return this.baseRecord.onCtrlD as (() => void) | undefined;
+  }
+  set onCtrlD(handler: (() => void) | undefined) {
+    this.baseRecord.onCtrlD = handler;
+  }
+
+  get onEscape(): (() => void) | undefined {
+    return this.baseRecord.onEscape as (() => void) | undefined;
+  }
+  set onEscape(handler: (() => void) | undefined) {
+    this.baseRecord.onEscape = handler;
+  }
+
+  get onPasteImage(): (() => void) | undefined {
+    return this.baseRecord.onPasteImage as (() => void) | undefined;
+  }
+  set onPasteImage(handler: (() => void) | undefined) {
+    this.baseRecord.onPasteImage = handler;
+  }
+
+  get onExtensionShortcut(): ((data: string) => void) | undefined {
+    return this.baseRecord.onExtensionShortcut as ((data: string) => void) | undefined;
+  }
+  set onExtensionShortcut(handler: ((data: string) => void) | undefined) {
+    this.baseRecord.onExtensionShortcut = handler;
+  }
+
+  get focused(): boolean {
+    return Boolean((this.base as EditorComponent & { focused?: boolean }).focused);
+  }
+  set focused(value: boolean) {
+    (this.base as EditorComponent & { focused?: boolean }).focused = value;
+  }
+
+  invalidate(): void {
+    this.base.invalidate();
+  }
+
+  getText(): string {
+    return this.base.getText();
+  }
+
+  setText(text: string): void {
+    this.base.setText(text);
+  }
+
+  insertTextAtCursor?(text: string): void {
+    if (this.base.insertTextAtCursor) {
+      this.base.insertTextAtCursor(text);
+    }
+  }
+
+  addToHistory?(text: string): void {
+    if (this.base.addToHistory) {
+      this.base.addToHistory(text);
+    }
+  }
+
+  getExpandedText?(): string {
+    return this.base.getExpandedText ? this.base.getExpandedText() : this.base.getText();
+  }
+
+  private syncBase(): void {
+    if (this.onSubmit) this.base.onSubmit = this.onSubmit;
+    else delete this.base.onSubmit;
+
+    if (this.onChange) this.base.onChange = this.onChange;
+    else delete this.base.onChange;
+
+    if (this.borderColor) this.base.borderColor = this.borderColor;
+  }
+
+  private applyBorderTheme(): void {
+    const mode = this.options.getMode();
+    const theme = this.options.ctx.ui.theme;
+
+    if (mode === "recording") {
+      this.base.borderColor = (str: string) => theme.fg("error", str);
+    } else if (mode === "finalizing") {
+      this.base.borderColor = (str: string) => theme.fg("warning", str);
+    } else {
+      this.base.borderColor = this.defaultBorderColor;
+    }
+  }
+
+  render(width: number): string[] {
+    this.syncBase();
+    this.applyBorderTheme();
+
+    const lines = this.base.render(width);
+    if (lines.length === 0) return lines;
+
+    const theme = this.options.ctx.ui.theme;
+    const mode = this.options.getMode();
+    const engine = this.options.getEngine();
+    const duration = this.options.getDurationSec();
+    const rms = this.options.getRms();
+    const tick = this.options.getTick();
+    const liveDraft = this.options.getLiveDraft();
+
+    let leftBadge = "";
+    let rightBadge = "";
+
+    if (mode === "recording") {
+      const dot = tick % 2 === 0 ? "●" : "○";
+      const vu = getVuWave(rms);
+      leftBadge = ` ${theme.fg("error", dot)} ${theme.fg("accent", `[${engine} ${duration}s]`)} ${theme.fg("accent", vu)} `;
+      rightBadge = ` ${theme.fg("dim", "enter: send · alt+v: finish · esc: cancel")} `;
+    } else if (mode === "finalizing") {
+      const frame = SPINNER_FRAMES[tick % SPINNER_FRAMES.length] ?? "⠋";
+      leftBadge = ` ${theme.fg("warning", frame)} ${theme.fg("warning", `[${engine}: reconciling context...]`)} `;
+      rightBadge = ` ${theme.fg("dim", "esc: cancel")} `;
+    } else if (mode === "cancelled") {
+      leftBadge = ` ${theme.fg("dim", "[cancelled]")} `;
+      rightBadge = ` ${theme.fg("dim", "alt+v")} `;
+    } else {
+      leftBadge = ` ${theme.fg("dim", `[voice: ${engine}]`)} `;
+      rightBadge = ` ${theme.fg("dim", "alt+v / f4")} `;
+    }
+
+    const borderFn = (s: string) => (this.base.borderColor ? this.base.borderColor(s) : s);
+    lines[0] = formatTopBorderLine(width, leftBadge, rightBadge, borderFn);
+
+    if ((mode === "recording" || mode === "finalizing") && liveDraft) {
+      const cursor = tick % 2 === 0 ? "▌" : " ";
+      const banner = truncateToWidth(
+        ` ${theme.fg("accent", "❯")} ${theme.fg("dim", `"${liveDraft}"`)} ${theme.fg("accent", cursor)}`,
+        Math.max(1, width),
+        "…"
+      );
+      lines.unshift(banner);
+    }
+
+    return lines;
+  }
+
+  handleInput(data: string): void {
+    this.syncBase();
+    const mode = this.options.getMode();
+
+    if (mode === "recording") {
+      if (matchesKey(data, "enter")) {
+        this.options.onSend(this.options.ctx);
+        return;
+      }
+      if (matchesKey(data, "escape")) {
+        this.options.onCancel(this.options.ctx);
+        return;
+      }
+    }
+
+    if (mode === "finalizing") {
+      if (matchesKey(data, "escape")) {
+        this.options.onCancel(this.options.ctx);
+        return;
+      }
+    }
+
+    if (matchesKey(data, "alt+v") || matchesKey(data, "f4")) {
+      this.options.onToggle(this.options.ctx);
+      return;
+    }
+
+    this.base.handleInput(data);
+  }
+}
+
+function createVoiceEditorProxy(
+  previousFactory: ((tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager) => EditorComponent) | undefined,
+  options: VoiceEditorOptions & { attachTui(tui: TUI): void }
+) {
+  return (tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager): EditorComponent => {
+    options.attachTui(tui);
+    const base = previousFactory?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
+    const defaultBorderColor = base.borderColor ?? theme.borderColor;
+    const wrapper = new VoiceEditorWrapper(base, options, defaultBorderColor);
+
+    return new Proxy(wrapper, {
+      get(target, prop, receiver) {
+        if (Reflect.has(target, prop)) {
+          const val = Reflect.get(target, prop, receiver);
+          if (typeof val === "function") return val.bind(target);
+          return val;
+        }
+        const baseVal = Reflect.get(base, prop);
+        if (typeof baseVal === "function") return baseVal.bind(base);
+        return baseVal;
+      },
+      set(target, prop, value, receiver) {
+        if (Reflect.has(target, prop)) {
+          return Reflect.set(target, prop, value, receiver);
+        }
+        return Reflect.set(base, prop, value);
+      },
+    }) as unknown as EditorComponent;
+  };
+}
+
 export default function (pi: ExtensionAPI) {
+  let mode: VoiceMode = "idle";
+  let activeEngine: VoiceEngine = "bridge";
   let isRecording = false;
   let recordProcess: ChildProcess | null = null;
   let recordedChunks: Buffer[] = [];
   let recordStartTime = 0;
-  let liveTimer: NodeJS.Timeout | null = null;
+  let animTimer: NodeJS.Timeout | null = null;
   let cloudDraftInterval: NodeJS.Timeout | null = null;
   let draftInProgress = false;
   let initialEditorText = "";
   let latestDraftText = "";
+  let currentRms = 0;
+  let animTick = 0;
+  let activeTui: TUI | undefined;
 
   let activeBridge: AntigravityBridge | null = null;
   let bridgeSessionId: string | null = null;
@@ -372,7 +668,29 @@ export default function (pi: ExtensionAPI) {
   let bridgeFinalTranscript = "";
   let bridgePendingAudio: Buffer[] = [];
 
-  async function startBridgeStream(bridge: AntigravityBridge, editorText: string): Promise<boolean> {
+  const requestRender = () => activeTui?.requestRender();
+
+  function startAnimation() {
+    if (animTimer) return;
+    animTimer = setInterval(() => {
+      animTick += 1;
+      requestRender();
+    }, 120);
+  }
+
+  function stopAnimation() {
+    if (animTimer) {
+      clearInterval(animTimer);
+      animTimer = null;
+    }
+    requestRender();
+  }
+
+  async function startBridgeStream(
+    bridge: AntigravityBridge,
+    editorText: string,
+    ctx: ExtensionContext
+  ): Promise<boolean> {
     bridgeSessionId = null;
     bridgeFinalTranscript = "";
     bridgeSeq = 0;
@@ -431,6 +749,9 @@ export default function (pi: ExtensionAPI) {
                   if (parsed.transcription.isFinal) {
                     bridgeFinalTranscript = text;
                   }
+                  const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
+                  ctx.ui.setEditorText(initialEditorText + sep + text);
+                  requestRender();
                 }
               } catch {}
             }
@@ -539,68 +860,42 @@ export default function (pi: ExtensionAPI) {
 
     if (!activeBridge && !apiKey) {
       ctx.ui.notify(
-        "No engine available. Run '/voice-key' to set Gemini key, or start Antigravity for unlimited local bridge.",
+        "No engine available. Run '/voice-key' to set Gemini key, or start Antigravity for unlimited bridge.",
         "warning"
       );
       return;
     }
 
     isRecording = true;
+    mode = "recording";
     recordedChunks = [];
     recordStartTime = Date.now();
     initialEditorText = ctx.ui.getEditorText() || "";
     latestDraftText = "";
+    currentRms = 0;
     draftInProgress = false;
 
-    const voiceConfig = readVoiceConfig();
     const projectTokens = extractProjectTokens(ctx.cwd, 35);
     const biasingHints = projectTokens.slice(0, 10).join(", ");
 
     let usingBridge = false;
     if (activeBridge) {
-      usingBridge = await startBridgeStream(activeBridge, initialEditorText);
+      usingBridge = await startBridgeStream(activeBridge, initialEditorText, ctx);
     }
+    activeEngine = usingBridge ? "bridge" : "cloud";
 
-    const modeLabel = usingBridge ? "bridge" : "cloud";
-    ctx.ui.setStatus("pi-voice", `[rec ${modeLabel}] 0.0s (alt+v to stop)`);
-    ctx.ui.setWidget("pi-voice", [
-      `Voice input active [${usingBridge ? "Antigravity Bridge (unlimited)" : "Cloud Gemini"}]`,
-      biasingHints ? `Context: ${biasingHints}...` : "Context: ready",
-      "Press Alt+V or F4 to finish",
-    ]);
+    startAnimation();
 
-    liveTimer = setInterval(() => {
-      if (!isRecording) return;
-      const elapsed = ((Date.now() - recordStartTime) / 1000).toFixed(1);
-      const draftHint = latestDraftText ? ` | "${latestDraftText}"` : "";
-      ctx.ui.setStatus("pi-voice", `[rec ${modeLabel} ${elapsed}s]${draftHint}`);
-
-      if (latestDraftText) {
-        const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
-        ctx.ui.setEditorText(initialEditorText + sep + latestDraftText);
-        ctx.ui.setWidget("pi-voice", [
-          `Draft: "${latestDraftText}"`,
-          "Press Alt+V or F4 to finish",
-        ]);
-      }
-    }, 200);
-
-    if (!usingBridge && apiKey && voiceConfig.liveDraft === true) {
+    // Live Draft is ENABLED by default for Cloud fallback as well
+    if (!usingBridge && apiKey) {
       cloudDraftInterval = setInterval(async () => {
         if (!isRecording || draftInProgress) return;
 
         const pcmSnapshot = Buffer.concat(recordedChunks);
-        if (pcmSnapshot.length < 16000 * 2 * 1.0) return;
+        if (pcmSnapshot.length < 16000 * 2 * 0.8) return;
 
-        const recentWindowBytes = Math.min(pcmSnapshot.length, 16000 * 2 * 1.5);
-        const recentSlice = pcmSnapshot.slice(pcmSnapshot.length - recentWindowBytes);
-        let sumSq = 0;
-        for (let i = 0; i < recentSlice.length; i += 2) {
-          const s = recentSlice.readInt16LE(i);
-          sumSq += s * s;
-        }
-        const rms = Math.sqrt(sumSq / (recentSlice.length / 2));
-        if (rms < 35) return;
+        // VAD: only poll when audio is active
+        if (currentRms < 35) return;
 
         draftInProgress = true;
         try {
@@ -608,11 +903,14 @@ export default function (pi: ExtensionAPI) {
           const draft = await transcribeFastDraft(wavSnapshot, apiKey, biasingHints);
           if (isRecording && draft && draft !== "[NO_SPEECH]") {
             latestDraftText = draft;
+            const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
+            ctx.ui.setEditorText(initialEditorText + sep + draft);
+            requestRender();
           }
         } catch {} finally {
           draftInProgress = false;
         }
-      }, 1500);
+      }, 1400);
     }
 
     try {
@@ -621,20 +919,23 @@ export default function (pi: ExtensionAPI) {
       });
     } catch (err: any) {
       isRecording = false;
-      if (liveTimer) clearInterval(liveTimer);
+      mode = "idle";
+      stopAnimation();
       if (cloudDraftInterval) clearInterval(cloudDraftInterval);
-      ctx.ui.setStatus("pi-voice", undefined);
-      ctx.ui.setWidget("pi-voice", undefined);
       ctx.ui.notify(`Failed to start arecord: ${err.message}`, "error");
       logVoice(`arecord spawn error: ${err.message}`);
       return;
     }
 
     let pcmSliceBuffer = Buffer.alloc(0);
-    const CHUNK_SIZE = 1280; // 40ms at 16kHz 16-bit mono
+    const CHUNK_SIZE = 1280; // 40ms
 
     recordProcess.stdout?.on("data", (chunk: Buffer) => {
       recordedChunks.push(chunk);
+
+      // Compute live RMS for VU meter
+      const sliceBytes = Math.min(chunk.length, 1280);
+      currentRms = computeRms(chunk.slice(chunk.length - sliceBytes));
 
       if (usingBridge) {
         pcmSliceBuffer = Buffer.concat([pcmSliceBuffer, chunk]);
@@ -651,24 +952,16 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  async function stopRecording(ctx: ExtensionContext) {
+  async function stopRecording(ctx: ExtensionContext, autoSubmit = false): Promise<void> {
     if (!isRecording) return;
     isRecording = false;
+    mode = "finalizing";
+    requestRender();
 
-    if (liveTimer) {
-      clearInterval(liveTimer);
-      liveTimer = null;
-    }
     if (cloudDraftInterval) {
       clearInterval(cloudDraftInterval);
       cloudDraftInterval = null;
     }
-
-    ctx.ui.setStatus("pi-voice", "finalizing transcript...");
-    ctx.ui.setWidget("pi-voice", [
-      "Finalizing transcript...",
-      latestDraftText ? `Draft: "${latestDraftText}"` : "Processing context...",
-    ]);
 
     if (recordProcess) {
       const proc = recordProcess;
@@ -676,7 +969,7 @@ export default function (pi: ExtensionAPI) {
       await new Promise<void>((resolve) => {
         proc.on("close", () => resolve());
         proc.kill("SIGTERM");
-        setTimeout(resolve, 250);
+        setTimeout(resolve, 200);
       });
     }
 
@@ -685,133 +978,171 @@ export default function (pi: ExtensionAPI) {
     const durationSec = (totalBytes / (16000 * 2)).toFixed(1);
 
     if (totalBytes < 4800) {
-      ctx.ui.setStatus("pi-voice", undefined);
-      ctx.ui.setWidget("pi-voice", undefined);
+      mode = "idle";
+      stopAnimation();
       ctx.ui.setEditorText(initialEditorText);
       ctx.ui.notify(`Recording too short (${durationSec}s).`, "warning");
       return;
     }
 
-    let sumSq = 0;
-    const numSamples = Math.floor(totalBytes / 2);
-    for (let i = 0; i < totalBytes; i += 2) {
-      const sample = pcmBuffer.readInt16LE(i);
-      sumSq += sample * sample;
-    }
-    const rms = Math.sqrt(sumSq / (numSamples || 1));
+    const finalRms = computeRms(pcmBuffer);
+    logVoice(`Recording stopped: ${durationSec}s, ${totalBytes} bytes, RMS: ${finalRms.toFixed(1)}`);
 
-    logVoice(`Recording stopped: ${durationSec}s, ${totalBytes} bytes, RMS: ${rms.toFixed(1)}`);
-
-    if (rms < 35) {
-      ctx.ui.setStatus("pi-voice", undefined);
-      ctx.ui.setWidget("pi-voice", undefined);
+    if (finalRms < 35) {
+      mode = "idle";
+      stopAnimation();
       ctx.ui.setEditorText(initialEditorText);
-      ctx.ui.notify(`Microphone level low (RMS: ${rms.toFixed(1)}).`, "warning");
+      ctx.ui.notify(`Microphone level low (RMS: ${finalRms.toFixed(1)}).`, "warning");
       logVoice("Warning: audio RMS below threshold (< 35)");
       return;
     }
 
+    let finalTranscript = "";
+
     if (activeBridge && bridgeSessionId) {
       try {
         const bridgeText = await endBridgeSession();
-        ctx.ui.setStatus("pi-voice", undefined);
-        ctx.ui.setWidget("pi-voice", undefined);
-
         if (bridgeText && bridgeText !== "[NO_SPEECH]") {
-          const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
-          ctx.ui.setEditorText(initialEditorText + sep + bridgeText);
-          ctx.ui.notify(`[${durationSec}s bridge]: "${bridgeText}"`, "info");
-          logVoice(`Bridge finalized (${durationSec}s): "${bridgeText}"`);
-          return;
+          finalTranscript = bridgeText;
+        } else if (latestDraftText) {
+          finalTranscript = latestDraftText;
         }
-
-        if (latestDraftText) {
-          const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
-          ctx.ui.setEditorText(initialEditorText + sep + latestDraftText);
-          ctx.ui.notify(`[${durationSec}s bridge]: "${latestDraftText}"`, "info");
-          return;
-        }
-
-        ctx.ui.setEditorText(initialEditorText);
-        ctx.ui.notify(`Recorded ${durationSec}s. No speech detected.`, "info");
-        logVoice(`Bridge transcribed (${durationSec}s): [NO_SPEECH]`);
-        return;
       } catch (err: any) {
         logVoice(`Bridge finalize failed: ${err.message}, attempting cloud fallback`);
       }
     }
 
-    const apiKey = resolveApiKey();
-    if (!apiKey) {
-      ctx.ui.setStatus("pi-voice", undefined);
-      ctx.ui.setWidget("pi-voice", undefined);
-      if (latestDraftText) {
-        const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
-        ctx.ui.setEditorText(initialEditorText + sep + latestDraftText);
+    if (!finalTranscript) {
+      const apiKey = resolveApiKey();
+      if (apiKey) {
+        try {
+          const wavBuffer = pcmToWav(pcmBuffer, 16000);
+          const projectTokens = extractProjectTokens(ctx.cwd, 40);
+          finalTranscript = await transcribeFinalReconciliation(
+            wavBuffer,
+            apiKey,
+            initialEditorText,
+            projectTokens
+          );
+        } catch (err: any) {
+          logVoice(`Cloud fallback error: ${err.message}`);
+          if (
+            err.message.includes("429") ||
+            err.message.includes("RESOURCE_EXHAUSTED") ||
+            err.message.includes("quota")
+          ) {
+            const retryMatch =
+              err.message.match(/retry in ([0-9.]+)s/i) || err.message.match(/retryDelay"?:\s*"([0-9]+)s"/i);
+            const waitSec = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) : 60;
+            ctx.ui.notify(
+              `Gemini API rate limit reached (5 req/min). Retry in ${waitSec}s, or run Antigravity for unlimited bridge.`,
+              "warning"
+            );
+          } else {
+            ctx.ui.notify(`Transcription error: ${err.message}`, "error");
+          }
+        }
       }
-      ctx.ui.notify("No Gemini API key found for fallback. Run '/voice-key' to set it.", "error");
-      return;
     }
 
-    try {
-      const wavBuffer = pcmToWav(pcmBuffer, 16000);
-      const projectTokens = extractProjectTokens(ctx.cwd, 40);
+    mode = "idle";
+    stopAnimation();
 
-      const finalTranscript = await transcribeFinalReconciliation(
-        wavBuffer,
-        apiKey,
-        initialEditorText,
-        projectTokens
-      );
-
-      ctx.ui.setStatus("pi-voice", undefined);
-      ctx.ui.setWidget("pi-voice", undefined);
-
-      if (!finalTranscript || finalTranscript === "[NO_SPEECH]") {
-        if (latestDraftText) {
-          const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
-          ctx.ui.setEditorText(initialEditorText + sep + latestDraftText);
-          ctx.ui.notify(`[${durationSec}s]: "${latestDraftText}"`, "info");
-        } else {
-          ctx.ui.setEditorText(initialEditorText);
-          ctx.ui.notify(`Recorded ${durationSec}s. No speech detected.`, "info");
-          logVoice(`Transcribed (${durationSec}s): [NO_SPEECH]`);
-        }
+    if (!finalTranscript || finalTranscript === "[NO_SPEECH]") {
+      if (latestDraftText) {
+        finalTranscript = latestDraftText;
+      } else {
+        ctx.ui.setEditorText(initialEditorText);
+        ctx.ui.notify(`Recorded ${durationSec}s. No speech detected.`, "info");
+        logVoice(`Transcribed (${durationSec}s): [NO_SPEECH]`);
         return;
       }
-
-      const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
-      ctx.ui.setEditorText(initialEditorText + sep + finalTranscript);
-
-      ctx.ui.notify(`[${durationSec}s cloud]: "${finalTranscript}"`, "info");
-      logVoice(`Finalized (${durationSec}s): "${finalTranscript}"`);
-    } catch (err: any) {
-      ctx.ui.setStatus("pi-voice", undefined);
-      ctx.ui.setWidget("pi-voice", undefined);
-      if (latestDraftText) {
-        const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
-        ctx.ui.setEditorText(initialEditorText + sep + latestDraftText);
-      }
-
-      if (err.message.includes("429") || err.message.includes("RESOURCE_EXHAUSTED") || err.message.includes("quota")) {
-        const retryMatch = err.message.match(/retry in ([0-9.]+)s/i) || err.message.match(/retryDelay"?:\s*"([0-9]+)s"/i);
-        const waitSec = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) : 60;
-        ctx.ui.notify(`Gemini API rate limit reached (5 req/min on Free Tier). Retry in ${waitSec}s, or start Antigravity for unlimited bridge.`, "warning");
-        logVoice(`Rate limit 429: wait ${waitSec}s`);
-      } else {
-        ctx.ui.notify(`Transcription error: ${err.message}`, "error");
-        logVoice(`Final reconciliation error: ${err.message}`);
-      }
     }
+
+    const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
+    const fullText = initialEditorText + sep + finalTranscript;
+
+    if (autoSubmit) {
+      ctx.ui.setEditorText("");
+      if (ctx.isIdle()) {
+        pi.sendUserMessage(fullText);
+      } else {
+        pi.sendUserMessage(fullText, { deliverAs: "followUp" });
+      }
+      ctx.ui.notify(`[Sent voice]: "${finalTranscript}"`, "info");
+      logVoice(`Auto-submitted (${durationSec}s): "${finalTranscript}"`);
+    } else {
+      ctx.ui.setEditorText(fullText);
+      ctx.ui.notify(`[${durationSec}s ${activeEngine}]: "${finalTranscript}"`, "info");
+      logVoice(`Finalized (${durationSec}s): "${finalTranscript}"`);
+    }
+  }
+
+  function cancelRecording(ctx: ExtensionContext) {
+    if (!isRecording && mode === "idle") return;
+
+    isRecording = false;
+    mode = "cancelled";
+    stopAnimation();
+
+    if (cloudDraftInterval) {
+      clearInterval(cloudDraftInterval);
+      cloudDraftInterval = null;
+    }
+
+    if (recordProcess) {
+      recordProcess.kill("SIGTERM");
+      recordProcess = null;
+    }
+
+    if (bridgeReader) {
+      try {
+        bridgeReader.cancel();
+      } catch {}
+      bridgeReader = null;
+    }
+
+    ctx.ui.setEditorText(initialEditorText);
+    ctx.ui.notify("Voice recording cancelled.", "info");
+    logVoice("Voice recording cancelled by user (Escape).");
+
+    setTimeout(() => {
+      if (mode === "cancelled") {
+        mode = "idle";
+        requestRender();
+      }
+    }, 800);
   }
 
   function toggleVoice(ctx: ExtensionContext) {
     if (isRecording) {
-      stopRecording(ctx);
+      stopRecording(ctx, false);
     } else {
       startRecording(ctx);
     }
   }
+
+  const editorOptions: VoiceEditorOptions & { attachTui(tui: TUI): void } = {
+    ctx: undefined as unknown as ExtensionContext,
+    getMode: () => mode,
+    getEngine: () => activeEngine,
+    getDurationSec: () => ((Date.now() - recordStartTime) / 1000).toFixed(1),
+    getLiveDraft: () => latestDraftText,
+    getRms: () => currentRms,
+    getTick: () => animTick,
+    attachTui: (tui: TUI) => {
+      activeTui = tui;
+    },
+    onSend: (handlerCtx) => {
+      void stopRecording(handlerCtx, true);
+    },
+    onToggle: (handlerCtx) => {
+      toggleVoice(handlerCtx);
+    },
+    onCancel: (handlerCtx) => {
+      cancelRecording(handlerCtx);
+    },
+  };
 
   pi.registerShortcut("alt+v", {
     description: "Toggle voice input",
@@ -858,13 +1189,13 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const bridge = await detectAntigravityBridge();
       const apiKey = resolveApiKey();
-      const config = readVoiceConfig();
 
       const lines = [
         `Bridge: ${bridge ? `Connected (PID: ${bridge.pid}, port: ${bridge.port})` : "Not detected"}`,
         `Cloud key: ${apiKey ? `Configured (...${apiKey.slice(-6)})` : "Not set"}`,
-        `Live draft: ${config.liveDraft ? "Enabled" : "Disabled (default for Free Tier)"}`,
-        `Engine priority: ${bridge ? "Antigravity Bridge (unlimited streaming)" : "Cloud Gemini (single-turn)"}`,
+        `Live draft: Enabled (real-time stream on Bridge & Cloud VAD)`,
+        `Engine priority: ${bridge ? "Antigravity Bridge (unlimited streaming)" : "Cloud Gemini (single-turn fallback)"}`,
+        `Shortcuts: Alt+V / F4 (record & edit), Enter (record & send), Esc (cancel)`,
       ];
 
       ctx.ui.notify(lines.join("\n"), "info");
@@ -889,15 +1220,49 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    editorOptions.ctx = ctx;
+
+    const uiRecord = ctx.ui as unknown as Record<string, unknown> | undefined;
+    const getEditorFn =
+      typeof uiRecord?.getEditorComponent === "function"
+        ? (uiRecord.getEditorComponent as () => unknown)
+        : undefined;
+    const previousEditor = getEditorFn ? getEditorFn() : undefined;
+    const setEditorFn =
+      typeof uiRecord?.setEditorComponent === "function"
+        ? (uiRecord.setEditorComponent as (factory: unknown) => void)
+        : undefined;
+
+    if (setEditorFn) {
+      const previousFactory =
+        typeof previousEditor === "function"
+          ? (previousEditor as Parameters<typeof createVoiceEditorProxy>[0])
+          : undefined;
+      setEditorFn(createVoiceEditorProxy(previousFactory, editorOptions));
+    }
+
     const bridge = await detectAntigravityBridge();
     const hasKey = !!resolveApiKey();
 
     if (bridge) {
+      activeEngine = "bridge";
       ctx.ui.notify("pi-voice loaded [Antigravity bridge active, Alt+V to toggle]", "info");
     } else if (hasKey) {
+      activeEngine = "cloud";
       ctx.ui.notify("pi-voice loaded [Cloud Gemini mode, Alt+V to toggle]", "info");
     } else {
       ctx.ui.notify("pi-voice loaded. Run /voice-key or start Antigravity for voice input.", "info");
+    }
+  });
+
+  pi.on("session_shutdown", () => {
+    stopAnimation();
+    if (cloudDraftInterval) clearInterval(cloudDraftInterval);
+    if (recordProcess) recordProcess.kill("SIGTERM");
+    if (bridgeReader) {
+      try {
+        bridgeReader.cancel();
+      } catch {}
     }
   });
 }

@@ -72,13 +72,22 @@ Alternatively, export the environment variable:
 export GEMINI_API_KEY="your-key-here"
 ```
 
-## Keybindings and commands
+## Keybindings and interactive controls
 
-- `Alt+V` or `F4`: toggle recording on or off
+- `Alt+V` or `F4`: toggle recording on or off (inserts transcript into active prompt)
+- `Enter` (while recording): stop recording and immediately submit prompt to agent
+- `Esc` (while recording): cancel recording and discard audio
 - `/voice`: toggle recording on or off
 - `/voice-status`: inspect active engine mode, bridge port, and key status
 - `/voice-key`: set or update standalone API key
 - `/voice-log`: display recent audio diagnostics
+
+## Visual TUI elements
+
+- Dynamic prompt border tint: turns error/accent color while recording, amber while reconciling, and restores default when idle.
+- Live VU meter: real-time audio amplitude wave embedded directly in the prompt top border.
+- Floating draft banner: displays in-flight transcribed speech with a live cursor above the prompt box while speaking.
+- Real-time prompt streaming: incoming transcript updates directly in the active prompt as you speak.
 
 ## Troubleshooting
 
