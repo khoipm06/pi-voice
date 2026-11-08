@@ -199,7 +199,7 @@ async function transcribeFinalReconciliation(
 
   const systemInstruction =
     "You are a speech transcriber for a terminal coding assistant. " +
-    "Accurately transcribe speech in English and Vietnamese, including code-switching. " +
+    "Accurately transcribe speech across multiple languages with seamless code-switching. " +
     "Reconcile punctuation, capitalization, and technical terms.\n" +
     "Rules:\n" +
     "1. Output only the verbatim transcription. No markdown formatting, quotes, or explanations.\n" +

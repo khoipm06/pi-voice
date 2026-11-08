@@ -4,20 +4,20 @@ Voice input extension for Pi with live draft transcription and workspace context
 
 ## Why this exists
 
-Most speech-to-text tools fail when coding in bilingual environments:
+Standard speech-to-text tools struggle in technical terminal workflows:
 
-1. Locale lock: engines like Whisper or browser Web Speech require selecting a fixed language locale up front. When speaking Vietnamese mixed with English technical terms, traditional engines attempt to spell English words using Vietnamese phonetic rules, mangling camelCase names and library identifiers.
-2. Missing project context: standard transcription has no awareness of your repository. It cannot tell whether you said a common word or an exact function name defined in your workspace.
-3. Blind dictation: batch-only tools force you to speak into silence and wait for a final block of text, offering no visual confirmation while speaking.
-4. Heavy local overhead: running local speech models requires dedicated GPU memory or continuous CPU load that drains laptop batteries.
+1. Locale lock. Traditional engines like Whisper or browser speech APIs require binding to a single fixed locale. When speaking a native language while referencing English programming terms, flags, or acronyms like JWT and gRPC, fixed-locale engines attempt to match those terms against common dictionary words, corrupting technical syntax.
+2. Domain mismatch. General-purpose models train on everyday conversational speech. Programming jargon like async, mutex, stdout, or camelCase identifiers are easily misheard as similar-sounding common phrases without domain guidance.
+3. Lack of repository context. Off-the-shelf voice input has no visibility into the active project. It cannot tell whether you meant an ordinary word or an exact function name defined in your workspace.
+4. Blind dictation. Most command line voice tools record into silence and dump a block of text only after stopping, offering no feedback while speaking.
+5. Resource consumption. Running heavy local models consumes memory and compute that compete with language servers, compilers, and test suites.
 
 ## How it works
 
-This extension solves those issues through three design choices:
-
-- Native code-switching via Gemini: Gemini processes speech directly as multimodal audio tokens. It switches between Vietnamese and English naturally without phonetic warping.
-- Workspace context biasing: before transcribing, the extension gathers exported identifiers, function names, and variable symbols from your active files. It injects these into the prompt so technical names like `fetchData`, `AuthController`, or `useMemo` match your codebase.
-- Dual-stage live transcription: while recording, a low-latency background worker streams rolling draft text directly into your Pi prompt line every 1.2 seconds. When you press stop, the full audio buffer undergoes a final reconciliation pass to correct punctuation, grammar, and technical spelling across the entire sentence.
+- Multilingual code-switching. Gemini processes speech directly as multimodal audio tokens without an upfront locale lock. It handles natural transitions between languages and technical vocabulary in the same sentence.
+- Workspace context biasing. Before transcribing, the extension collects identifiers, function names, and types from open files and the current repository. Passing these tokens guides the model to match your codebase's exact spelling and casing.
+- Dual-stage live transcription. While recording, a background worker streams rolling draft text directly into the Pi prompt line every 1.2 seconds. When you finish, the full audio buffer undergoes a reconciliation pass to correct punctuation, grammar, and technical terms across the entire statement.
+- Lightweight capture. Audio is captured via native ALSA `arecord` at 16kHz PCM, avoiding local model inference overhead.
 
 ## Prerequisites
 
