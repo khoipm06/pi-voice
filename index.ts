@@ -1,5 +1,6 @@
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -7,6 +8,8 @@ import os from "node:os";
 const AUTH_FILE = path.join(os.homedir(), ".pi", "agent", "auth.json");
 const VOICE_CONFIG_FILE = path.join(os.homedir(), ".pi", "agent", "voice.json");
 const VOICE_LOG_FILE = path.join(os.homedir(), ".pi", "agent", "voice.log");
+
+const SESSION_ID = crypto.randomUUID();
 
 interface VoiceConfig {
   apiKey?: string;
@@ -162,7 +165,13 @@ async function transcribeFastDraft(
 
   const response = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-session-id": SESSION_ID,
+      "session-id": SESSION_ID,
+      "x-session-affinity": SESSION_ID,
+      "x-opencode-session-id": SESSION_ID,
+    },
     body: JSON.stringify(payload),
   });
 
@@ -227,7 +236,13 @@ async function transcribeFinalReconciliation(
 
   const response = await fetch(endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "x-session-id": SESSION_ID,
+      "session-id": SESSION_ID,
+      "x-session-affinity": SESSION_ID,
+      "x-opencode-session-id": SESSION_ID,
+    },
     body: JSON.stringify(payload),
   });
 
@@ -257,10 +272,7 @@ export default function (pi: ExtensionAPI) {
 
     const apiKey = resolveApiKey();
     if (!apiKey) {
-      ctx.ui.notify(
-        "No Gemini API key found. Run '/voice-key' to set it.",
-        "warning"
-      );
+      ctx.ui.notify("No Gemini API key found. Run '/voice-key' to set it.", "warning");
       return;
     }
 
@@ -404,10 +416,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.setStatus("pi-voice", undefined);
       ctx.ui.setWidget("pi-voice", undefined);
       ctx.ui.setEditorText(initialEditorText);
-      ctx.ui.notify(
-        `Microphone input level too low (RMS: ${rms.toFixed(1)}). Check input device.`,
-        "warning"
-      );
+      ctx.ui.notify(`Microphone level low (RMS: ${rms.toFixed(1)}).`, "warning");
       logVoice("Warning: audio RMS below threshold (< 40)");
       return;
     }
@@ -499,7 +508,7 @@ export default function (pi: ExtensionAPI) {
       let key = args.trim();
 
       if (!key) {
-        const inputKey = await ctx.ui.input("Enter Gemini API key:", "AIzaSy...");
+        const inputKey = await ctx.ui.input("Enter Gemini API key:");
         if (!inputKey || !inputKey.trim()) {
           ctx.ui.notify("Key configuration cancelled.", "warning");
           return;
@@ -508,7 +517,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       persistApiKey(key);
-      ctx.ui.notify("Saved Gemini API key to auth.json (mode 0600).", "info");
+      ctx.ui.notify("Saved Gemini API key.", "info");
     },
   });
 
