@@ -13,7 +13,7 @@ import {
   type EditorTheme,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -198,17 +198,45 @@ function encodeConnectEnvelope(jsonObj: any): Buffer {
   return envelope;
 }
 
-function extractProjectTokens(cwd: string, limit = 40): string[] {
+function collapseCJKSpaces(text: string): string {
+  return text.replace(
+    /([\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af])\s+([\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af])/gu,
+    "$1$2"
+  );
+}
+
+function extractProjectTokens(cwd: string, limit = 50): string[] {
   const tokens = new Set<string>();
   const tokenRegex = /\b[a-zA-Z_$][a-zA-Z0-9_$]{2,35}\b/g;
 
+  // 1. Git branch and modified files context (inspired by language_server AsrContext)
+  try {
+    const gitBranch = spawnSync("git", ["branch", "--show-current"], { cwd, encoding: "utf8" });
+    if (gitBranch.stdout) {
+      for (const part of gitBranch.stdout.trim().split(/[\/_\-\s]+/)) {
+        if (part.length > 2 && /^[a-zA-Z0-9]+$/.test(part)) tokens.add(part);
+      }
+    }
+    const gitStatus = spawnSync("git", ["status", "--short"], { cwd, encoding: "utf8" });
+    if (gitStatus.stdout) {
+      for (const line of gitStatus.stdout.split("\n")) {
+        const file = line.trim().split(/\s+/).pop();
+        if (file) {
+          const base = path.basename(file, path.extname(file));
+          if (base.length > 2) tokens.add(base);
+        }
+      }
+    }
+  } catch {}
+
+  // 2. Workspace source files scanning
   try {
     const files = fs.readdirSync(cwd, { withFileTypes: true });
     for (const dirent of files) {
       if (dirent.name.startsWith(".") || dirent.name === "node_modules") continue;
       if (dirent.isFile() && /\.(ts|js|py|go|rs|json|md)$/i.test(dirent.name)) {
         try {
-          const content = fs.readFileSync(path.join(cwd, dirent.name), "utf8").slice(0, 5000);
+          const content = fs.readFileSync(path.join(cwd, dirent.name), "utf8").slice(0, 6000);
           let match;
           while ((match = tokenRegex.exec(content)) !== null) {
             tokens.add(match[0]);
@@ -220,7 +248,7 @@ function extractProjectTokens(cwd: string, limit = 40): string[] {
     }
   } catch {}
 
-  return Array.from(tokens);
+  return Array.from(tokens).slice(0, limit);
 }
 
 function pcmToWav(pcmBuffer: Buffer, sampleRate = 16000): Buffer {
@@ -267,7 +295,8 @@ async function transcribeFastDraft(
   apiKey: string,
   biasingHints: string
 ): Promise<string> {
-  const model = "gemini-2.5-flash";
+  const voiceConfig = readVoiceConfig();
+  const model = voiceConfig.model || "gemini-2.5-flash";
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const payload = {
@@ -322,7 +351,8 @@ async function transcribeFinalReconciliation(
   editorContext: string,
   projectTokens: string[]
 ): Promise<string> {
-  const model = "gemini-2.5-flash";
+  const voiceConfig = readVoiceConfig();
+  const model = voiceConfig.model || "gemini-2.5-flash";
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const biasingContext = [
@@ -388,7 +418,8 @@ async function transcribeFinalReconciliation(
 
   const data = await response.json();
   const candidateText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-  return candidateText.replace(/^["'`]+|["'`]+$/g, "").trim();
+  const cleaned = candidateText.replace(/^["'`]+|["'`]+$/g, "").trim();
+  return collapseCJKSpaces(cleaned);
 }
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -886,31 +917,33 @@ export default function (pi: ExtensionAPI) {
 
     startAnimation();
 
-    // Live Draft is ENABLED by default for Cloud fallback as well
-    if (!usingBridge && apiKey) {
+    // Live Draft polling: only run if explicitly enabled in voice.json
+    // On Free Tier (5 RPM limit), polling every 1.4s consumes the quota in seconds.
+    const vCfg = readVoiceConfig();
+    if (!usingBridge && apiKey && vCfg.liveDraft === true) {
       cloudDraftInterval = setInterval(async () => {
         if (!isRecording || draftInProgress) return;
 
         const pcmSnapshot = Buffer.concat(recordedChunks);
-        if (pcmSnapshot.length < 16000 * 2 * 0.8) return;
+        if (pcmSnapshot.length < 16000 * 2 * 1.5) return;
 
         // VAD: only poll when audio is active
-        if (currentRms < 35) return;
+        if (currentRms < 40) return;
 
         draftInProgress = true;
         try {
           const wavSnapshot = pcmToWav(pcmSnapshot, 16000);
           const draft = await transcribeFastDraft(wavSnapshot, apiKey, biasingHints);
           if (isRecording && draft && draft !== "[NO_SPEECH]") {
-            latestDraftText = draft;
+            latestDraftText = collapseCJKSpaces(draft);
             const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
-            ctx.ui.setEditorText(initialEditorText + sep + draft);
+            ctx.ui.setEditorText(initialEditorText + sep + latestDraftText);
             requestRender();
           }
         } catch {} finally {
           draftInProgress = false;
         }
-      }, 1400);
+      }, 2500);
     }
 
     try {
@@ -1035,7 +1068,7 @@ export default function (pi: ExtensionAPI) {
               err.message.match(/retry in ([0-9.]+)s/i) || err.message.match(/retryDelay"?:\s*"([0-9]+)s"/i);
             const waitSec = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) : 60;
             ctx.ui.notify(
-              `Gemini API rate limit reached (5 req/min). Retry in ${waitSec}s, or run Antigravity for unlimited bridge.`,
+              `Gemini API rate limit reached. Retry in ${waitSec}s, or switch model with /voice-model.`,
               "warning"
             );
           } else {
@@ -1184,18 +1217,46 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("voice-model", {
+    description: "Inspect or configure speech transcription model",
+    handler: async (args, ctx) => {
+      const targetModel = args.trim();
+      const currentConfig = readVoiceConfig();
+
+      if (!targetModel) {
+        const activeModel = currentConfig.model || "gemini-2.5-flash";
+        ctx.ui.notify(
+          `Active model: ${activeModel}\nUsage: /voice-model <model-name>\nOptions: gemini-2.5-flash, gemini-3.5-flash-lite`,
+          "info"
+        );
+        return;
+      }
+
+      currentConfig.model = targetModel;
+      try {
+        fs.mkdirSync(path.dirname(VOICE_CONFIG_FILE), { recursive: true });
+        fs.writeFileSync(VOICE_CONFIG_FILE, JSON.stringify(currentConfig, null, 2), { mode: 0o600 });
+        ctx.ui.notify(`Configured voice model to: ${targetModel}`, "info");
+      } catch (err: any) {
+        ctx.ui.notify(`Failed to save model: ${err.message}`, "error");
+      }
+    },
+  });
+
   pi.registerCommand("voice-status", {
     description: "Inspect voice transcription engine status",
     handler: async (_args, ctx) => {
+      const vCfg = readVoiceConfig();
+      const activeModel = vCfg.model || "gemini-2.5-flash";
       const bridge = await detectAntigravityBridge();
       const apiKey = resolveApiKey();
 
       const lines = [
-        `Bridge: ${bridge ? `Connected (PID: ${bridge.pid}, port: ${bridge.port})` : "Not detected"}`,
-        `Cloud key: ${apiKey ? `Configured (...${apiKey.slice(-6)})` : "Not set"}`,
-        `Live draft: Enabled (real-time stream on Bridge & Cloud VAD)`,
-        `Engine priority: ${bridge ? "Antigravity Bridge (unlimited streaming)" : "Cloud Gemini (single-turn fallback)"}`,
-        `Shortcuts: Alt+V / F4 (record & edit), Enter (record & send), Esc (cancel)`,
+        `Engine: ${bridge ? "Antigravity Bridge (local ConnectRPC)" : "Standalone Gemini (direct cloud)"}`,
+        `Model: ${activeModel}`,
+        `API key: ${apiKey ? `Configured (...${apiKey.slice(-6)})` : "Not set"}`,
+        `Live draft: ${vCfg.liveDraft === true ? "Enabled" : "Adaptive single-pass (quota-safe)"}`,
+        `Controls: Enter (send), Alt+V / F4 (edit), Esc (cancel)`,
       ];
 
       ctx.ui.notify(lines.join("\n"), "info");
@@ -1246,12 +1307,12 @@ export default function (pi: ExtensionAPI) {
 
     if (bridge) {
       activeEngine = "bridge";
-      ctx.ui.notify("pi-voice loaded [Antigravity bridge active, Alt+V to toggle]", "info");
+      ctx.ui.notify("pi-voice active [Bridge connected, Alt+V to toggle]", "info");
     } else if (hasKey) {
       activeEngine = "cloud";
-      ctx.ui.notify("pi-voice loaded [Cloud Gemini mode, Alt+V to toggle]", "info");
+      ctx.ui.notify("pi-voice active [Standalone Gemini mode, Alt+V to toggle]", "info");
     } else {
-      ctx.ui.notify("pi-voice loaded. Run /voice-key or start Antigravity for voice input.", "info");
+      ctx.ui.notify("pi-voice ready. Run /voice-key to configure Gemini API key.", "info");
     }
   });
 

@@ -1,45 +1,48 @@
 # pi-voice
 
-Voice input extension for Pi with live streaming transcription, Antigravity engine bridge, and workspace context biasing.
+Voice input extension for Pi powered by Google Gemini multimodal intelligence, workspace context biasing, and terminal TUI integration.
 
 ## Why this exists
 
-Standard speech-to-text tools struggle in technical terminal workflows:
+Generic speech-to-text tools perform poorly in technical CLI coding workflows:
 
-1. Locale lock. Traditional engines require binding to a single fixed locale. When speaking a native language while referencing English programming terms, flags, or acronyms like JWT and gRPC, fixed-locale engines corrupt technical syntax.
-2. Domain mismatch. General-purpose models mishear technical jargon like async, mutex, stdout, or camelCase identifiers without domain guidance.
-3. Lack of repository context. Off-the-shelf voice input has no visibility into the active project. It cannot tell whether you meant an ordinary word or an exact function name defined in your workspace.
-4. Blind dictation. Most command line voice tools record into silence and dump a block of text only after stopping, offering no feedback while speaking.
-5. Quota exhaustion on Free Tier keys. Fast polling of REST STT endpoints consumes standard Free Tier limits (5 requests per minute) within seconds of speaking.
+1. Locale locking. Standard engines bind to a single locale. When speaking a native language with embedded English technical terms (such as `kubectl`, `JWT`, `gRPC`, `mutex`), fixed-locale models produce corrupted syntax. Gemini handles multi-lingual code-switching natively.
+2. Missing workspace context. Conventional transcription models have no knowledge of your repository. They cannot infer whether you said an ordinary dictionary word or an exact function name defined in your project.
+3. Quota exhaustion. Polling public REST transcription endpoints consumes Free Tier limits (5 requests per minute) within seconds of speaking.
+4. Blind recording. Most terminal voice utilities record silently into a buffer with no visual audio feedback, leaving the user unsure whether microphone input is active or clipping.
 
-## How it works
+`pi-voice` resolves these issues through repository-aware context biasing, live VU meter amplitude feedback, and an adaptive single-pass transcription pipeline designed to operate cleanly within standard API quotas.
 
-The extension operates with a dual-engine architecture:
+## Architecture
 
-### 1. Antigravity Bridge Engine (Primary)
+The extension implements the transcription architecture reverse-engineered from Google internal language servers:
 
-When running alongside Google Antigravity, `pi-voice` automatically detects the local `language_server` on `127.0.0.1` and establishes a bidirectional ConnectRPC audio stream:
+### 1. Workspace Context Biasing (`extractAsrContext`)
+Before finalizing an audio recording, the extension indexes:
+- Git status: currently modified files, tracked file basenames, and active branch name.
+- Codebase symbols: top exported identifiers, functions, and types from local project source files (`.ts`, `.py`, `.go`, `.rs`, `.json`).
+- Editor context: current text in the terminal prompt.
 
-- Real-time token streaming: Audio chunks (40ms PCM) stream continuously over ConnectRPC, updating the editor prompt in real time as you speak.
-- Unlimited quota: Routes through Antigravity's persistent gRPC cloud channel rather than discrete public REST requests. Zero quota limits, zero 5 RPM ceiling.
-- Zero credential overhead: Inherits authenticated IDE session credentials; does not require a standalone Gemini API key when the bridge is active.
+These tokens are injected into the multimodal prompt instructions, biasing the model towards exact identifiers and syntax used in your repository.
 
-### 2. Standalone Cloud Gemini Engine (Fallback)
+### 2. Post-Processing Pipeline
+- Spacing normalization (`collapseCJKSpaces`): automatically removes unwanted whitespace between CJK runes while preserving natural spacing for alphanumeric languages.
+- Syntax sanitization: strips conversational filler, markdown formatting blocks, and extraneous quotes.
 
-When Antigravity is not active, the extension falls back to direct Gemini 2.5 Flash API calls:
+### 3. Rate-Limit Protected Pipeline
+- Operates via adaptive single-pass multimodal reconciliation on utterance completion. Exactly one request is dispatched per utterance, eliminating the 429 quota exhaustion that occurs with continuous polling on Free Tier keys.
+- Real-time visual feedback is handled locally through the TUI VU meter and status banner without consuming API quota during speech.
+- Compatible with `gemini-2.5-flash` and `gemini-3.5-flash-lite`.
 
-- Rate-limit protected: Uses a single-turn reconciliation pass on stop by default. Exactly one API call per utterance prevents hitting the 5 RPM Free Tier ceiling.
-- Context biasing: Gathers active tokens, types, and identifiers from open files and prompt history to steer transcription accuracy.
-- Configurable live drafts: For paid tier keys with high request ceilings, draft streaming can be enabled via `~/.pi/agent/voice.json` (`"liveDraft": true`).
+### 4. Optional ConnectRPC Local Bridge
+If Google Antigravity is active on localhost, `pi-voice` can opportunistically connect to the local language server bridge for zero-configuration, token-free streaming. This is completely optional; no IDE dependency is required.
 
 ## Prerequisites
 
-- Linux with ALSA `arecord` installed
-- Google Antigravity running locally (recommended for unlimited real-time streaming) OR a Gemini API key
+- Linux with ALSA `arecord` (`sudo dnf install alsa-utils` or `sudo apt-get install alsa-utils`)
+- A Google Gemini API key (Free Tier or Pay-as-you-go)
 
 ## Installation
-
-### Manual
 
 Copy `index.ts` to your Pi extensions directory:
 
@@ -54,52 +57,51 @@ Reload Pi:
 /reload
 ```
 
-## Setup
+## Configuration
 
-When running Antigravity, no configuration is necessary; the bridge connects automatically.
-
-To configure a standalone fallback API key:
+Set your Gemini API key using the interactive command:
 
 ```text
 /voice-key
 ```
 
-This saves your key persistently to `~/.pi/agent/auth.json` under the `google` provider.
-
-Alternatively, export the environment variable:
+The key is saved in `~/.pi/agent/auth.json` under the `google` provider. Alternatively, export the environment variable:
 
 ```bash
-export GEMINI_API_KEY="your-key-here"
+export GEMINI_API_KEY="your-api-key"
 ```
 
-## Keybindings and interactive controls
+To switch models:
 
-- `Alt+V` or `F4`: toggle recording on or off (inserts transcript into active prompt)
-- `Enter` (while recording): stop recording and immediately submit prompt to agent
-- `Esc` (while recording): cancel recording and discard audio
-- `/voice`: toggle recording on or off
-- `/voice-status`: inspect active engine mode, bridge port, and key status
-- `/voice-key`: set or update standalone API key
-- `/voice-log`: display recent audio diagnostics
+```text
+/voice-model gemini-3.5-flash-lite
+```
 
-## Visual TUI elements
+## Keybindings and Controls
 
-- Dynamic prompt border tint: turns error/accent color while recording, amber while reconciling, and restores default when idle.
-- Live VU meter: real-time audio amplitude wave embedded directly in the prompt top border.
-- Floating draft banner: displays in-flight transcribed speech with a live cursor above the prompt box while speaking.
-- Real-time prompt streaming: incoming transcript updates directly in the active prompt as you speak.
+- `Alt+V` or `F4`: Toggle recording on or off (inserts transcribed text into prompt)
+- `Enter` (while recording): Stop recording, transcribe, and immediately submit prompt to agent
+- `Esc` (while recording): Cancel recording and discard captured audio
+- `/voice`: Toggle recording
+- `/voice-status`: Inspect active engine mode, model, and key status
+- `/voice-model [name]`: Inspect or change the active transcription model
+- `/voice-key`: Set or update the Gemini API key
+- `/voice-log`: Display recent audio levels and transcription logs
 
-## Troubleshooting
+## Visual Interface
 
-Run `/voice-status` to inspect whether the Antigravity bridge is connected or if cloud fallback is in use.
+- Dynamic prompt border tint: switches to accent color while recording, warning color during transcription, and restores default when idle.
+- Top border VU meter: real-time amplitude wave (` ▂▃▅▆█`) reacting dynamically to your voice level.
+- Live streaming banner: displays duration counter (`[● REC 00:04]`) and floating speech status above the prompt.
 
-Run `/voice-log` to inspect:
+## Diagnostics
 
-- Recorded duration in seconds
-- Total bytes captured
-- Root mean square (RMS) audio level
+If speech is not captured, run `/voice-log` to check audio diagnostics:
 
-If the log shows RMS below 35, check your default capture device:
+- RMS audio level: values below 35 indicate low microphone input or an inactive device.
+- Duration and total bytes captured.
+
+Verify your default ALSA recording source:
 
 ```bash
 arecord -l
