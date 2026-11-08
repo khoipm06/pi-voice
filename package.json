@@ -1,0 +1,28 @@
+{
+  "name": "pi-voice",
+  "version": "0.1.0",
+  "description": "Voice input extension for Pi with live draft transcription and context biasing",
+  "main": "index.ts",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "bun build index.ts --outdir dist --target node"
+  },
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "voice",
+    "speech-to-text",
+    "context-biasing",
+    "gemini"
+  ],
+  "author": "Khoi Pham Minh <khoipm06@gmail.com>",
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
