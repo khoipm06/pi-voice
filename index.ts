@@ -9,12 +9,19 @@ const AUTH_FILE = path.join(os.homedir(), ".pi", "agent", "auth.json");
 const VOICE_CONFIG_FILE = path.join(os.homedir(), ".pi", "agent", "voice.json");
 const VOICE_LOG_FILE = path.join(os.homedir(), ".pi", "agent", "voice.log");
 
-const SESSION_ID = crypto.randomUUID();
+const CLOUD_SESSION_ID = crypto.randomUUID();
 
 interface VoiceConfig {
   apiKey?: string;
   model?: string;
   sampleRate?: number;
+  liveDraft?: boolean;
+}
+
+interface AntigravityBridge {
+  port: number;
+  csrfToken: string;
+  pid: number;
 }
 
 function logVoice(message: string): void {
@@ -23,6 +30,15 @@ function logVoice(message: string): void {
     fs.mkdirSync(path.dirname(VOICE_LOG_FILE), { recursive: true });
     fs.appendFileSync(VOICE_LOG_FILE, `[${timestamp}] ${message}\n`, { mode: 0o600 });
   } catch {}
+}
+
+function readVoiceConfig(): VoiceConfig {
+  try {
+    if (fs.existsSync(VOICE_CONFIG_FILE)) {
+      return JSON.parse(fs.readFileSync(VOICE_CONFIG_FILE, "utf8"));
+    }
+  } catch {}
+  return {};
 }
 
 function resolveApiKey(): string | null {
@@ -39,12 +55,8 @@ function resolveApiKey(): string | null {
     logVoice(`Error reading auth.json: ${err}`);
   }
 
-  try {
-    if (fs.existsSync(VOICE_CONFIG_FILE)) {
-      const voiceData = JSON.parse(fs.readFileSync(VOICE_CONFIG_FILE, "utf8"));
-      if (voiceData.apiKey) return String(voiceData.apiKey).trim();
-    }
-  } catch {}
+  const voiceConfig = readVoiceConfig();
+  if (voiceConfig.apiKey) return String(voiceConfig.apiKey).trim();
 
   return null;
 }
@@ -71,16 +83,102 @@ function persistApiKey(apiKey: string): void {
   }
 
   try {
-    let voiceConfig: VoiceConfig = {};
-    if (fs.existsSync(VOICE_CONFIG_FILE)) {
-      try {
-        voiceConfig = JSON.parse(fs.readFileSync(VOICE_CONFIG_FILE, "utf8"));
-      } catch {}
-    }
+    const voiceConfig = readVoiceConfig();
     voiceConfig.apiKey = cleanKey;
     fs.mkdirSync(path.dirname(VOICE_CONFIG_FILE), { recursive: true });
     fs.writeFileSync(VOICE_CONFIG_FILE, JSON.stringify(voiceConfig, null, 2), { mode: 0o600 });
   } catch {}
+}
+
+function getListeningPortsForPid(pid: number): number[] {
+  const ports: number[] = [];
+  try {
+    const fdDir = `/proc/${pid}/fd`;
+    if (!fs.existsSync(fdDir)) return ports;
+
+    const fds = fs.readdirSync(fdDir);
+    const inodes = new Set<string>();
+    for (const fd of fds) {
+      try {
+        const link = fs.readlinkSync(`${fdDir}/${fd}`);
+        const m = link.match(/^socket:\[(\d+)\]$/);
+        if (m) inodes.add(m[1]);
+      } catch {}
+    }
+
+    for (const netFile of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+      if (!fs.existsSync(netFile)) continue;
+      const content = fs.readFileSync(netFile, "utf8");
+      const lines = content.split("\n");
+      for (let i = 1; i < lines.length; i++) {
+        const parts = lines[i].trim().split(/\s+/);
+        if (parts.length >= 10) {
+          const state = parts[3];
+          const inode = parts[9];
+          if (state === "0A" && inodes.has(inode)) {
+            const localAddr = parts[1];
+            const portHex = localAddr.split(":")[1];
+            if (portHex) {
+              ports.push(parseInt(portHex, 16));
+            }
+          }
+        }
+      }
+    }
+  } catch {}
+  return ports;
+}
+
+async function detectAntigravityBridge(): Promise<AntigravityBridge | null> {
+  try {
+    const procEntries = fs.readdirSync("/proc");
+    for (const entry of procEntries) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = parseInt(entry, 10);
+      try {
+        const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
+        if (cmdline.includes("language_server") && cmdline.includes("--csrf_token")) {
+          const matchToken =
+            cmdline.match(/--csrf_token\x00([^\x00]+)/) ||
+            cmdline.match(/--csrf_token=([^\x00\s]+)/);
+          if (!matchToken) continue;
+          const csrfToken = matchToken[1];
+
+          const ports = getListeningPortsForPid(pid);
+          for (const port of ports) {
+            try {
+              const res = await fetch(
+                `http://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/StreamAudioTranscription`,
+                {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/connect+json",
+                    "x-codeium-csrf-token": csrfToken,
+                    Cookie: `csrfToken=${csrfToken}`,
+                  },
+                  body: new Uint8Array([0, 0, 0, 0, 2, 123, 125]),
+                  signal: AbortSignal.timeout(600),
+                }
+              );
+              if (res.status === 200 || res.status === 400) {
+                return { port, csrfToken, pid };
+              }
+            } catch {}
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
+function encodeConnectEnvelope(jsonObj: any): Buffer {
+  const payload = Buffer.from(JSON.stringify(jsonObj));
+  const envelope = Buffer.alloc(5 + payload.length);
+  envelope.writeUInt8(0, 0);
+  envelope.writeUInt32BE(payload.length, 1);
+  payload.copy(envelope, 5);
+  return envelope;
 }
 
 function extractProjectTokens(cwd: string, limit = 40): string[] {
@@ -167,10 +265,10 @@ async function transcribeFastDraft(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-session-id": SESSION_ID,
-      "session-id": SESSION_ID,
-      "x-session-affinity": SESSION_ID,
-      "x-opencode-session-id": SESSION_ID,
+      "x-session-id": CLOUD_SESSION_ID,
+      "session-id": CLOUD_SESSION_ID,
+      "x-session-affinity": CLOUD_SESSION_ID,
+      "x-opencode-session-id": CLOUD_SESSION_ID,
     },
     body: JSON.stringify(payload),
   });
@@ -238,10 +336,10 @@ async function transcribeFinalReconciliation(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-session-id": SESSION_ID,
-      "session-id": SESSION_ID,
-      "x-session-affinity": SESSION_ID,
-      "x-opencode-session-id": SESSION_ID,
+      "x-session-id": CLOUD_SESSION_ID,
+      "session-id": CLOUD_SESSION_ID,
+      "x-session-affinity": CLOUD_SESSION_ID,
+      "x-opencode-session-id": CLOUD_SESSION_ID,
     },
     body: JSON.stringify(payload),
   });
@@ -262,17 +360,188 @@ export default function (pi: ExtensionAPI) {
   let recordedChunks: Buffer[] = [];
   let recordStartTime = 0;
   let liveTimer: NodeJS.Timeout | null = null;
-  let liveDraftInterval: NodeJS.Timeout | null = null;
+  let cloudDraftInterval: NodeJS.Timeout | null = null;
   let draftInProgress = false;
   let initialEditorText = "";
   let latestDraftText = "";
 
+  let activeBridge: AntigravityBridge | null = null;
+  let bridgeSessionId: string | null = null;
+  let bridgeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let bridgeSeq = 0;
+  let bridgeFinalTranscript = "";
+  let bridgePendingAudio: Buffer[] = [];
+
+  async function startBridgeStream(bridge: AntigravityBridge, editorText: string): Promise<boolean> {
+    bridgeSessionId = null;
+    bridgeFinalTranscript = "";
+    bridgeSeq = 0;
+    bridgePendingAudio = [];
+
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:${bridge.port}/exa.language_server_pb.LanguageServerService/StreamAudioTranscription`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/connect+json",
+            "Connect-Protocol-Version": "1",
+            "x-codeium-csrf-token": bridge.csrfToken,
+            Cookie: `csrfToken=${bridge.csrfToken}`,
+          },
+          body: new Uint8Array(
+            encodeConnectEnvelope({
+              mimeType: "audio/pcm;rate=16000",
+              preCursorText: editorText.slice(-100),
+              postCursorText: "",
+            })
+          ),
+        }
+      );
+
+      if (!res.ok || !res.body) {
+        logVoice(`Bridge connection failed: HTTP ${res.status}`);
+        return false;
+      }
+
+      bridgeReader = res.body.getReader();
+
+      (async () => {
+        let streamBuf = Buffer.alloc(0);
+        try {
+          while (bridgeReader) {
+            while (streamBuf.length >= 5) {
+              const flags = streamBuf.readUInt8(0);
+              const len = streamBuf.readUInt32BE(1);
+              if (streamBuf.length < 5 + len) break;
+              const msgBytes = streamBuf.slice(5, 5 + len);
+              streamBuf = streamBuf.slice(5 + len);
+
+              try {
+                const parsed = JSON.parse(msgBytes.toString("utf8"));
+                if (parsed.ready?.sessionId) {
+                  bridgeSessionId = parsed.ready.sessionId;
+                  logVoice(`Bridge session established: ${bridgeSessionId}`);
+                  drainBridgeQueue();
+                }
+
+                if (parsed.transcription?.text) {
+                  const text = parsed.transcription.text.trim();
+                  latestDraftText = text;
+                  if (parsed.transcription.isFinal) {
+                    bridgeFinalTranscript = text;
+                  }
+                }
+              } catch {}
+            }
+
+            const { value, done } = await bridgeReader.read();
+            if (done) break;
+            streamBuf = Buffer.concat([streamBuf, Buffer.from(value)]);
+          }
+        } catch (err: any) {
+          if (err.name !== "AbortError") {
+            logVoice(`Bridge stream error: ${err.message}`);
+          }
+        }
+      })();
+
+      return true;
+    } catch (err: any) {
+      logVoice(`Bridge start error: ${err.message}`);
+      return false;
+    }
+  }
+
+  async function sendBridgeAudioChunk(chunk: Buffer): Promise<void> {
+    if (!activeBridge || !bridgeSessionId) {
+      bridgePendingAudio.push(chunk);
+      return;
+    }
+
+    const currentSeq = bridgeSeq++;
+    try {
+      await fetch(
+        `http://127.0.0.1:${activeBridge.port}/exa.language_server_pb.LanguageServerService/SendAudioChunk`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-codeium-csrf-token": activeBridge.csrfToken,
+            Cookie: `csrfToken=${activeBridge.csrfToken}`,
+          },
+          body: JSON.stringify({
+            sessionId: bridgeSessionId,
+            data: chunk.toString("base64"),
+            sequenceNumber: currentSeq,
+          }),
+        }
+      );
+    } catch (err: any) {
+      logVoice(`Error sending audio chunk #${currentSeq}: ${err.message}`);
+    }
+  }
+
+  async function drainBridgeQueue(): Promise<void> {
+    if (!activeBridge || !bridgeSessionId) return;
+    while (bridgePendingAudio.length > 0) {
+      const chunk = bridgePendingAudio.shift();
+      if (chunk) {
+        await sendBridgeAudioChunk(chunk);
+      }
+    }
+  }
+
+  async function endBridgeSession(): Promise<string> {
+    if (!activeBridge || !bridgeSessionId) {
+      return bridgeFinalTranscript || latestDraftText;
+    }
+
+    try {
+      await fetch(
+        `http://127.0.0.1:${activeBridge.port}/exa.language_server_pb.LanguageServerService/EndAudioSession`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-codeium-csrf-token": activeBridge.csrfToken,
+            Cookie: `csrfToken=${activeBridge.csrfToken}`,
+          },
+          body: JSON.stringify({
+            sessionId: bridgeSessionId,
+          }),
+        }
+      );
+    } catch (err: any) {
+      logVoice(`EndAudioSession error: ${err.message}`);
+    }
+
+    const startWait = Date.now();
+    while (!bridgeFinalTranscript && Date.now() - startWait < 1500) {
+      await new Promise((r) => setTimeout(r, 40));
+    }
+
+    try {
+      if (bridgeReader) {
+        await bridgeReader.cancel();
+      }
+    } catch {}
+    bridgeReader = null;
+
+    return bridgeFinalTranscript || latestDraftText;
+  }
+
   async function startRecording(ctx: ExtensionContext) {
     if (isRecording) return;
 
+    activeBridge = await detectAntigravityBridge();
     const apiKey = resolveApiKey();
-    if (!apiKey) {
-      ctx.ui.notify("No Gemini API key found. Run '/voice-key' to set it.", "warning");
+
+    if (!activeBridge && !apiKey) {
+      ctx.ui.notify(
+        "No engine available. Run '/voice-key' to set Gemini key, or start Antigravity for unlimited local bridge.",
+        "warning"
+      );
       return;
     }
 
@@ -283,13 +552,20 @@ export default function (pi: ExtensionAPI) {
     latestDraftText = "";
     draftInProgress = false;
 
+    const voiceConfig = readVoiceConfig();
     const projectTokens = extractProjectTokens(ctx.cwd, 35);
     const biasingHints = projectTokens.slice(0, 10).join(", ");
 
-    ctx.ui.setStatus("pi-voice", "[rec] 0.0s (alt+v to stop)");
+    let usingBridge = false;
+    if (activeBridge) {
+      usingBridge = await startBridgeStream(activeBridge, initialEditorText);
+    }
+
+    const modeLabel = usingBridge ? "bridge" : "cloud";
+    ctx.ui.setStatus("pi-voice", `[rec ${modeLabel}] 0.0s (alt+v to stop)`);
     ctx.ui.setWidget("pi-voice", [
-      "Voice recording active",
-      biasingHints ? `Biasing: ${biasingHints}...` : "Biasing: ready",
+      `Voice input active [${usingBridge ? "Antigravity Bridge (unlimited)" : "Cloud Gemini"}]`,
+      biasingHints ? `Context: ${biasingHints}...` : "Context: ready",
       "Press Alt+V or F4 to finish",
     ]);
 
@@ -297,45 +573,47 @@ export default function (pi: ExtensionAPI) {
       if (!isRecording) return;
       const elapsed = ((Date.now() - recordStartTime) / 1000).toFixed(1);
       const draftHint = latestDraftText ? ` | "${latestDraftText}"` : "";
-      ctx.ui.setStatus("pi-voice", `[rec ${elapsed}s]${draftHint}`);
-    }, 300);
+      ctx.ui.setStatus("pi-voice", `[rec ${modeLabel} ${elapsed}s]${draftHint}`);
 
-    liveDraftInterval = setInterval(async () => {
-      if (!isRecording || draftInProgress) return;
-
-      const pcmSnapshot = Buffer.concat(recordedChunks);
-      if (pcmSnapshot.length < 16000 * 2 * 0.8) return;
-
-      const recentWindowBytes = Math.min(pcmSnapshot.length, 16000 * 2 * 1.5);
-      const recentSlice = pcmSnapshot.slice(pcmSnapshot.length - recentWindowBytes);
-      let sumSq = 0;
-      for (let i = 0; i < recentSlice.length; i += 2) {
-        const s = recentSlice.readInt16LE(i);
-        sumSq += s * s;
+      if (latestDraftText) {
+        const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
+        ctx.ui.setEditorText(initialEditorText + sep + latestDraftText);
+        ctx.ui.setWidget("pi-voice", [
+          `Draft: "${latestDraftText}"`,
+          "Press Alt+V or F4 to finish",
+        ]);
       }
-      const rms = Math.sqrt(sumSq / (recentSlice.length / 2));
-      if (rms < 35) return;
+    }, 200);
 
-      draftInProgress = true;
-      try {
-        const wavSnapshot = pcmToWav(pcmSnapshot, 16000);
-        const draft = await transcribeFastDraft(wavSnapshot, apiKey, biasingHints);
+    if (!usingBridge && apiKey && voiceConfig.liveDraft === true) {
+      cloudDraftInterval = setInterval(async () => {
+        if (!isRecording || draftInProgress) return;
 
-        if (isRecording && draft && draft !== "[NO_SPEECH]") {
-          latestDraftText = draft;
-          const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
-          ctx.ui.setEditorText(initialEditorText + sep + draft);
-          ctx.ui.setWidget("pi-voice", [
-            `Draft: "${draft}"`,
-            "Press Alt+V or F4 to finish",
-          ]);
+        const pcmSnapshot = Buffer.concat(recordedChunks);
+        if (pcmSnapshot.length < 16000 * 2 * 1.0) return;
+
+        const recentWindowBytes = Math.min(pcmSnapshot.length, 16000 * 2 * 1.5);
+        const recentSlice = pcmSnapshot.slice(pcmSnapshot.length - recentWindowBytes);
+        let sumSq = 0;
+        for (let i = 0; i < recentSlice.length; i += 2) {
+          const s = recentSlice.readInt16LE(i);
+          sumSq += s * s;
         }
-      } catch (err: any) {
-        logVoice(`Live draft error: ${err.message}`);
-      } finally {
-        draftInProgress = false;
-      }
-    }, 1200);
+        const rms = Math.sqrt(sumSq / (recentSlice.length / 2));
+        if (rms < 35) return;
+
+        draftInProgress = true;
+        try {
+          const wavSnapshot = pcmToWav(pcmSnapshot, 16000);
+          const draft = await transcribeFastDraft(wavSnapshot, apiKey, biasingHints);
+          if (isRecording && draft && draft !== "[NO_SPEECH]") {
+            latestDraftText = draft;
+          }
+        } catch {} finally {
+          draftInProgress = false;
+        }
+      }, 1500);
+    }
 
     try {
       recordProcess = spawn("arecord", ["-q", "-r", "16000", "-c", "1", "-f", "S16_LE", "-t", "raw"], {
@@ -344,7 +622,7 @@ export default function (pi: ExtensionAPI) {
     } catch (err: any) {
       isRecording = false;
       if (liveTimer) clearInterval(liveTimer);
-      if (liveDraftInterval) clearInterval(liveDraftInterval);
+      if (cloudDraftInterval) clearInterval(cloudDraftInterval);
       ctx.ui.setStatus("pi-voice", undefined);
       ctx.ui.setWidget("pi-voice", undefined);
       ctx.ui.notify(`Failed to start arecord: ${err.message}`, "error");
@@ -352,8 +630,20 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    let pcmSliceBuffer = Buffer.alloc(0);
+    const CHUNK_SIZE = 1280; // 40ms at 16kHz 16-bit mono
+
     recordProcess.stdout?.on("data", (chunk: Buffer) => {
       recordedChunks.push(chunk);
+
+      if (usingBridge) {
+        pcmSliceBuffer = Buffer.concat([pcmSliceBuffer, chunk]);
+        while (pcmSliceBuffer.length >= CHUNK_SIZE) {
+          const slice = pcmSliceBuffer.slice(0, CHUNK_SIZE);
+          pcmSliceBuffer = pcmSliceBuffer.slice(CHUNK_SIZE);
+          sendBridgeAudioChunk(slice);
+        }
+      }
     });
 
     recordProcess.on("error", (err: any) => {
@@ -369,9 +659,9 @@ export default function (pi: ExtensionAPI) {
       clearInterval(liveTimer);
       liveTimer = null;
     }
-    if (liveDraftInterval) {
-      clearInterval(liveDraftInterval);
-      liveDraftInterval = null;
+    if (cloudDraftInterval) {
+      clearInterval(cloudDraftInterval);
+      cloudDraftInterval = null;
     }
 
     ctx.ui.setStatus("pi-voice", "finalizing transcript...");
@@ -386,7 +676,7 @@ export default function (pi: ExtensionAPI) {
       await new Promise<void>((resolve) => {
         proc.on("close", () => resolve());
         proc.kill("SIGTERM");
-        setTimeout(resolve, 300);
+        setTimeout(resolve, 250);
       });
     }
 
@@ -412,20 +702,54 @@ export default function (pi: ExtensionAPI) {
 
     logVoice(`Recording stopped: ${durationSec}s, ${totalBytes} bytes, RMS: ${rms.toFixed(1)}`);
 
-    if (rms < 40) {
+    if (rms < 35) {
       ctx.ui.setStatus("pi-voice", undefined);
       ctx.ui.setWidget("pi-voice", undefined);
       ctx.ui.setEditorText(initialEditorText);
       ctx.ui.notify(`Microphone level low (RMS: ${rms.toFixed(1)}).`, "warning");
-      logVoice("Warning: audio RMS below threshold (< 40)");
+      logVoice("Warning: audio RMS below threshold (< 35)");
       return;
+    }
+
+    if (activeBridge && bridgeSessionId) {
+      try {
+        const bridgeText = await endBridgeSession();
+        ctx.ui.setStatus("pi-voice", undefined);
+        ctx.ui.setWidget("pi-voice", undefined);
+
+        if (bridgeText && bridgeText !== "[NO_SPEECH]") {
+          const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
+          ctx.ui.setEditorText(initialEditorText + sep + bridgeText);
+          ctx.ui.notify(`[${durationSec}s bridge]: "${bridgeText}"`, "info");
+          logVoice(`Bridge finalized (${durationSec}s): "${bridgeText}"`);
+          return;
+        }
+
+        if (latestDraftText) {
+          const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
+          ctx.ui.setEditorText(initialEditorText + sep + latestDraftText);
+          ctx.ui.notify(`[${durationSec}s bridge]: "${latestDraftText}"`, "info");
+          return;
+        }
+
+        ctx.ui.setEditorText(initialEditorText);
+        ctx.ui.notify(`Recorded ${durationSec}s. No speech detected.`, "info");
+        logVoice(`Bridge transcribed (${durationSec}s): [NO_SPEECH]`);
+        return;
+      } catch (err: any) {
+        logVoice(`Bridge finalize failed: ${err.message}, attempting cloud fallback`);
+      }
     }
 
     const apiKey = resolveApiKey();
     if (!apiKey) {
       ctx.ui.setStatus("pi-voice", undefined);
       ctx.ui.setWidget("pi-voice", undefined);
-      ctx.ui.notify("No Gemini API key found. Run '/voice-key' to set it.", "error");
+      if (latestDraftText) {
+        const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
+        ctx.ui.setEditorText(initialEditorText + sep + latestDraftText);
+      }
+      ctx.ui.notify("No Gemini API key found for fallback. Run '/voice-key' to set it.", "error");
       return;
     }
 
@@ -459,7 +783,7 @@ export default function (pi: ExtensionAPI) {
       const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
       ctx.ui.setEditorText(initialEditorText + sep + finalTranscript);
 
-      ctx.ui.notify(`[${durationSec}s]: "${finalTranscript}"`, "info");
+      ctx.ui.notify(`[${durationSec}s cloud]: "${finalTranscript}"`, "info");
       logVoice(`Finalized (${durationSec}s): "${finalTranscript}"`);
     } catch (err: any) {
       ctx.ui.setStatus("pi-voice", undefined);
@@ -468,8 +792,16 @@ export default function (pi: ExtensionAPI) {
         const sep = initialEditorText && !initialEditorText.endsWith(" ") ? " " : "";
         ctx.ui.setEditorText(initialEditorText + sep + latestDraftText);
       }
-      ctx.ui.notify(`Transcription error: ${err.message}`, "error");
-      logVoice(`Final reconciliation error: ${err.message}`);
+
+      if (err.message.includes("429") || err.message.includes("RESOURCE_EXHAUSTED") || err.message.includes("quota")) {
+        const retryMatch = err.message.match(/retry in ([0-9.]+)s/i) || err.message.match(/retryDelay"?:\s*"([0-9]+)s"/i);
+        const waitSec = retryMatch ? Math.ceil(parseFloat(retryMatch[1])) : 60;
+        ctx.ui.notify(`Gemini API rate limit reached (5 req/min on Free Tier). Retry in ${waitSec}s, or start Antigravity for unlimited bridge.`, "warning");
+        logVoice(`Rate limit 429: wait ${waitSec}s`);
+      } else {
+        ctx.ui.notify(`Transcription error: ${err.message}`, "error");
+        logVoice(`Final reconciliation error: ${err.message}`);
+      }
     }
   }
 
@@ -521,6 +853,24 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("voice-status", {
+    description: "Inspect voice transcription engine status",
+    handler: async (_args, ctx) => {
+      const bridge = await detectAntigravityBridge();
+      const apiKey = resolveApiKey();
+      const config = readVoiceConfig();
+
+      const lines = [
+        `Bridge: ${bridge ? `Connected (PID: ${bridge.pid}, port: ${bridge.port})` : "Not detected"}`,
+        `Cloud key: ${apiKey ? `Configured (...${apiKey.slice(-6)})` : "Not set"}`,
+        `Live draft: ${config.liveDraft ? "Enabled" : "Disabled (default for Free Tier)"}`,
+        `Engine priority: ${bridge ? "Antigravity Bridge (unlimited streaming)" : "Cloud Gemini (single-turn)"}`,
+      ];
+
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
   pi.registerCommand("voice-log", {
     description: "View recent voice debugging logs",
     handler: async (_args, ctx) => {
@@ -539,11 +889,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    const bridge = await detectAntigravityBridge();
     const hasKey = !!resolveApiKey();
-    if (hasKey) {
-      ctx.ui.notify("pi-voice loaded (Alt+V or F4 to toggle)", "info");
+
+    if (bridge) {
+      ctx.ui.notify("pi-voice loaded [Antigravity bridge active, Alt+V to toggle]", "info");
+    } else if (hasKey) {
+      ctx.ui.notify("pi-voice loaded [Cloud Gemini mode, Alt+V to toggle]", "info");
     } else {
-      ctx.ui.notify("pi-voice loaded. Run /voice-key to set API key.", "info");
+      ctx.ui.notify("pi-voice loaded. Run /voice-key or start Antigravity for voice input.", "info");
     }
   });
 }

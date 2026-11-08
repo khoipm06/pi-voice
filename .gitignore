@@ -6,3 +6,5 @@ dist
 .env.*
 auth.json
 voice.json
+bun.lock
+bun.lockb
